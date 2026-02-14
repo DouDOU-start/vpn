@@ -1,12 +1,14 @@
 #!/bin/bash
 
 # Mihomo 管理脚本 (3X-UI 订阅版)
-# 功能: 订阅管理、节点切换、模式切换、状态查看
+# 功能: 自动安装、订阅管理、节点切换、模式切换、状态查看
 
 CONFIG_DIR="/etc/mihomo"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 SUB_FILE="$CONFIG_DIR/subscription.txt"
+MIHOMO_BIN="/usr/local/bin/mihomo"
 API_URL="http://127.0.0.1:9090"
+GITHUB_REPO="MetaCubeX/mihomo"
 
 # 颜色
 RED='\033[0;31m'
@@ -25,6 +27,207 @@ title() { echo -e "${CYAN}$1${NC}"; }
 # 检查 root 权限
 check_root() {
     [ "$EUID" -ne 0 ] && { error "请使用 root 权限运行"; exit 1; }
+}
+
+# ==================== 安装相关 ====================
+
+# 检测系统架构，返回 mihomo 下载用的架构名
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        armv7l)  echo "armv7" ;;
+        i686)    echo "386" ;;
+        *)       echo "" ;;
+    esac
+}
+
+# 检查 mihomo 是否已安装
+is_installed() {
+    [ -f "$MIHOMO_BIN" ] && [ -x "$MIHOMO_BIN" ]
+}
+
+# 获取已安装版本
+get_installed_version() {
+    if is_installed; then
+        "$MIHOMO_BIN" -v 2>/dev/null | grep -oP 'v[\d.]+(-alpha)?[\d.]*' | head -1 || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+# 获取最新版本号
+get_latest_version() {
+    local version
+    version=$(curl -sS --connect-timeout 10 "https://api.github.com/repos/$GITHUB_REPO/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+')
+    echo "$version"
+}
+
+# 安装 mihomo
+install_mihomo() {
+    local arch
+    arch=$(detect_arch)
+    if [ -z "$arch" ]; then
+        error "不支持的系统架构: $(uname -m)"
+        return 1
+    fi
+
+    info "系统架构: $(uname -m) -> mihomo-linux-$arch"
+
+    # 检查依赖
+    for cmd in curl gzip; do
+        if ! command -v "$cmd" &>/dev/null; then
+            info "正在安装依赖: $cmd"
+            if command -v apt-get &>/dev/null; then
+                apt-get update -qq && apt-get install -y -qq "$cmd"
+            elif command -v yum &>/dev/null; then
+                yum install -y -q "$cmd"
+            elif command -v dnf &>/dev/null; then
+                dnf install -y -q "$cmd"
+            else
+                error "无法自动安装 $cmd，请手动安装后重试"
+                return 1
+            fi
+        fi
+    done
+
+    # 获取最新版本
+    info "正在获取最新版本信息..."
+    local version
+    version=$(get_latest_version)
+    if [ -z "$version" ]; then
+        error "无法获取最新版本号，请检查网络连接"
+        return 1
+    fi
+    info "最新版本: $version"
+
+    # 构造下载 URL
+    local filename="mihomo-linux-$arch-$version.gz"
+    local download_url="https://github.com/$GITHUB_REPO/releases/download/$version/$filename"
+
+    # 下载
+    info "正在下载: $filename"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! curl -L --progress-bar --connect-timeout 15 -o "$tmp_dir/$filename" "$download_url"; then
+        error "下载失败: $download_url"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 解压并安装
+    info "正在安装..."
+    if ! gzip -d "$tmp_dir/$filename"; then
+        error "解压失败"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    local bin_file="$tmp_dir/mihomo-linux-$arch-$version"
+    chmod +x "$bin_file"
+    mv "$bin_file" "$MIHOMO_BIN"
+    rm -rf "$tmp_dir"
+
+    # 创建配置目录
+    mkdir -p "$CONFIG_DIR"
+
+    # 创建 systemd 服务
+    create_service
+
+    info "mihomo $version 安装完成！"
+    return 0
+}
+
+# 创建 systemd 服务文件
+create_service() {
+    cat > /etc/systemd/system/mihomo.service << 'SERVICEEOF'
+[Unit]
+Description=Mihomo Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+    systemctl daemon-reload
+    info "systemd 服务已创建"
+}
+
+# 更新 mihomo
+update_mihomo() {
+    local current_ver
+    current_ver=$(get_installed_version)
+    info "当前版本: $current_ver"
+
+    local latest_ver
+    latest_ver=$(get_latest_version)
+    if [ -z "$latest_ver" ]; then
+        error "无法获取最新版本"
+        return 1
+    fi
+    info "最新版本: $latest_ver"
+
+    if [ "$current_ver" = "$latest_ver" ]; then
+        info "已经是最新版本，无需更新"
+        return 0
+    fi
+
+    # 停止服务
+    local was_running=false
+    if systemctl is-active --quiet mihomo 2>/dev/null; then
+        was_running=true
+        info "正在停止服务..."
+        systemctl stop mihomo
+    fi
+
+    # 重新安装
+    install_mihomo
+
+    # 恢复服务状态
+    if $was_running; then
+        info "正在重新启动服务..."
+        systemctl start mihomo
+        sleep 2
+        if systemctl is-active --quiet mihomo; then
+            info "服务已恢复运行"
+        else
+            error "服务启动失败，请检查日志"
+        fi
+    fi
+}
+
+# 卸载 mihomo
+uninstall_mihomo() {
+    echo ""
+    read -p "确认卸载 mihomo？配置文件将被保留。(y/N): " confirm
+    [[ "$confirm" != [yY] ]] && return
+
+    # 停止并禁用服务
+    systemctl stop mihomo 2>/dev/null
+    systemctl disable mihomo 2>/dev/null
+
+    # 删除二进制和服务文件
+    rm -f "$MIHOMO_BIN"
+    rm -f /etc/systemd/system/mihomo.service
+    systemctl daemon-reload
+
+    info "mihomo 已卸载（配置文件保留在 $CONFIG_DIR）"
+
+    read -p "是否同时删除配置文件？(y/N): " del_conf
+    if [[ "$del_conf" == [yY] ]]; then
+        rm -rf "$CONFIG_DIR"
+        info "配置文件已删除"
+    fi
 }
 
 # 检查服务状态
@@ -705,6 +908,49 @@ EOF
     fi
 }
 
+# 安装管理菜单
+install_menu() {
+    echo ""
+    title "========== 安装管理 =========="
+    echo ""
+
+    if is_installed; then
+        echo -e "  安装状态: ${GREEN}已安装${NC}"
+        echo "  当前版本: $(get_installed_version)"
+    else
+        echo -e "  安装状态: ${RED}未安装${NC}"
+    fi
+    echo ""
+    echo "  1) 安装 mihomo"
+    echo "  2) 更新 mihomo"
+    echo "  3) 卸载 mihomo"
+    echo "  4) 重建 systemd 服务"
+    echo ""
+    echo "  0) 返回主菜单"
+    echo ""
+    title "=============================="
+    echo ""
+
+    read -p "请选择操作 [0-4]: " choice
+
+    case $choice in
+        1)
+            if is_installed; then
+                warn "mihomo 已安装 ($(get_installed_version))"
+                read -p "是否重新安装？(y/N): " reinstall
+                [[ "$reinstall" != [yY] ]] && return
+            fi
+            install_mihomo
+            read -p "按 Enter 继续..."
+            ;;
+        2) update_mihomo; read -p "按 Enter 继续..." ;;
+        3) uninstall_mihomo; read -p "按 Enter 继续..." ;;
+        4) create_service; read -p "按 Enter 继续..." ;;
+        0|"") return ;;
+        *) error "无效选择" ;;
+    esac
+}
+
 # ==================== 主菜单 ====================
 
 main_menu() {
@@ -714,7 +960,12 @@ main_menu() {
     title "║       Mihomo 管理面板 (3X-UI)          ║"
     title "╚════════════════════════════════════════╝"
     echo ""
-    echo "  状态: $(check_status)  模式: $(get_mode)  节点: $(get_current_proxy)"
+
+    if is_installed; then
+        echo "  状态: $(check_status)  模式: $(get_mode)  节点: $(get_current_proxy)"
+    else
+        echo -e "  状态: ${RED}未安装${NC}"
+    fi
     echo ""
     title "──────────────────────────────────────────"
     echo ""
@@ -724,6 +975,7 @@ main_menu() {
     echo "  4) 测试连接"
     echo "  5) 订阅管理"
     echo "  6) 服务管理"
+    echo "  7) 安装管理"
     echo ""
     echo "  0) 退出"
     echo ""
@@ -731,21 +983,50 @@ main_menu() {
     echo ""
 }
 
+# 首次运行检测，未安装时自动引导安装
+first_run_check() {
+    if ! is_installed; then
+        echo ""
+        warn "检测到 mihomo 尚未安装"
+        echo ""
+        read -p "是否立即安装 mihomo？(Y/n): " choice
+        if [[ "$choice" != [nN] ]]; then
+            install_mihomo
+            if is_installed; then
+                echo ""
+                info "安装完成！现在可以通过「订阅管理」添加订阅来开始使用。"
+                read -p "按 Enter 继续..."
+            else
+                error "安装失败，请检查网络后重试"
+                read -p "按 Enter 继续..."
+            fi
+        fi
+    fi
+}
+
 # 主程序
 main() {
     check_root
-    mkdir -p $CONFIG_DIR
+    mkdir -p "$CONFIG_DIR"
 
     # 如果有参数，直接导入订阅
     if [ -n "$1" ]; then
+        # 即使传了订阅参数，也需要确保 mihomo 已安装
+        if ! is_installed; then
+            warn "mihomo 尚未安装，正在自动安装..."
+            install_mihomo || { error "安装失败"; exit 1; }
+        fi
         import_subscription "$1"
         exit 0
     fi
 
+    # 首次运行检测
+    first_run_check
+
     # 交互式菜单
     while true; do
         main_menu
-        read -p "  请选择操作 [0-6]: " choice
+        read -p "  请选择操作 [0-7]: " choice
 
         case $choice in
             1) show_status; read -p "按 Enter 继续..." ;;
@@ -754,6 +1035,7 @@ main() {
             4) test_connection; read -p "按 Enter 继续..." ;;
             5) subscription_menu ;;
             6) service_menu ;;
+            7) install_menu ;;
             0) echo ""; info "再见！"; exit 0 ;;
             *) error "无效选择" ;;
         esac
